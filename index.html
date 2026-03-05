@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BETA SMART FINANCE PRO v2.0 - نظام التقسيط المرن المتطور</title>
+    <title>BETA SMART FINANCE PRO v3.0 - نظام التقسيط المرن المتطور</title>
     
     <script src="https://cdn.tailwindcss.com"></script>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
@@ -244,6 +244,7 @@
                     }
 
                     this.ready = true;
+                    this._migrateColumns();
                     this._persist();
                     return true;
                 } catch (err) {
@@ -262,6 +263,12 @@
                         discountRateMode TEXT DEFAULT 'manual',
                         minDownPaymentPercent REAL DEFAULT 5,
                         maxInstallmentYears INTEGER DEFAULT 8,
+                        deliveryDate TEXT DEFAULT '',
+                        deliveryPaymentPercent REAL DEFAULT 50,
+                        deliveryPaymentBasis TEXT DEFAULT 'unitValue',
+                        immediateDelivery INTEGER DEFAULT 0,
+                        maintenancePercent REAL DEFAULT 8,
+                        maintenanceDueMonths INTEGER DEFAULT 6,
                         baseSystem TEXT DEFAULT '{}',
                         description TEXT DEFAULT '',
                         color TEXT DEFAULT 'indigo',
@@ -296,6 +303,28 @@
                         updated_at TEXT DEFAULT (datetime('now'))
                     )
                 `);
+            }
+
+            _migrateColumns() {
+                // إضافة أعمدة جديدة لقواعد البيانات الموجودة
+                try {
+                    this.db.run("ALTER TABLE projects ADD COLUMN deliveryDate TEXT DEFAULT ''");
+                } catch (e) { /* Column already exists */ }
+                try {
+                    this.db.run("ALTER TABLE projects ADD COLUMN deliveryPaymentPercent REAL DEFAULT 50");
+                } catch (e) { /* Column already exists */ }
+                try {
+                    this.db.run("ALTER TABLE projects ADD COLUMN deliveryPaymentBasis TEXT DEFAULT 'unitValue'");
+                } catch (e) { /* Column already exists */ }
+                try {
+                    this.db.run("ALTER TABLE projects ADD COLUMN immediateDelivery INTEGER DEFAULT 0");
+                } catch (e) { /* Column already exists */ }
+                try {
+                    this.db.run("ALTER TABLE projects ADD COLUMN maintenancePercent REAL DEFAULT 8");
+                } catch (e) { /* Column already exists */ }
+                try {
+                    this.db.run("ALTER TABLE projects ADD COLUMN maintenanceDueMonths INTEGER DEFAULT 6");
+                } catch (e) { /* Column already exists */ }
             }
 
             _migrateFromLocalStorage() {
@@ -351,22 +380,29 @@
                     if (existing.length > 0 && existing[0].values.length > 0) {
                         this.db.run(`UPDATE projects SET 
                             name=?, cashDiscountRate=?, discountRate=?, discountRateMode=?,
-                            minDownPaymentPercent=?, maxInstallmentYears=?, baseSystem=?,
-                            description=?, color=?, updated_at=datetime('now')
+                            minDownPaymentPercent=?, maxInstallmentYears=?, deliveryDate=?, deliveryPaymentPercent=?, deliveryPaymentBasis=?, immediateDelivery=?, maintenancePercent=?, maintenanceDueMonths=?,
+                            baseSystem=?, description=?, color=?, updated_at=datetime('now')
                             WHERE id=?`,
                             [project.name, project.cashDiscountRate, project.discountRate,
                              project.discountRateMode, project.minDownPaymentPercent,
-                             project.maxInstallmentYears, baseSystemJSON,
-                             project.description, project.color, project.id]);
+                             project.maxInstallmentYears, project.deliveryDate || '',
+                             project.deliveryPaymentPercent || 50, project.deliveryPaymentBasis || 'unitValue',
+                             project.immediateDelivery ? 1 : 0, project.maintenancePercent || 8,
+                             project.maintenanceDueMonths || 6,
+                             baseSystemJSON, project.description, project.color, project.id]);
                     } else {
                         this.db.run(`INSERT INTO projects 
                             (id, name, cashDiscountRate, discountRate, discountRateMode,
-                             minDownPaymentPercent, maxInstallmentYears, baseSystem, description, color)
-                            VALUES (?,?,?,?,?,?,?,?,?,?)`,
+                             minDownPaymentPercent, maxInstallmentYears, deliveryDate, deliveryPaymentPercent, deliveryPaymentBasis, immediateDelivery, maintenancePercent, maintenanceDueMonths,
+                             baseSystem, description, color)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
                             [project.id, project.name, project.cashDiscountRate, project.discountRate,
                              project.discountRateMode, project.minDownPaymentPercent,
-                             project.maxInstallmentYears, baseSystemJSON,
-                             project.description, project.color]);
+                             project.maxInstallmentYears, project.deliveryDate || '',
+                             project.deliveryPaymentPercent || 50, project.deliveryPaymentBasis || 'unitValue',
+                             project.immediateDelivery ? 1 : 0, project.maintenancePercent || 8,
+                             project.maintenanceDueMonths || 6,
+                             baseSystemJSON, project.description, project.color]);
                     }
                     this._persist();
                     return true;
@@ -899,7 +935,9 @@
                     semiannualPayments = [],
                     quarterlyPayments = [],
                     quarterlyStartDate = null,
-                    installmentDay = 1
+                    installmentDay = 1,
+                    proposedInstallments = [],
+                    proposedYears = 0
                 } = params;
 
                 let knownPV = downPayment;
@@ -984,22 +1022,55 @@
                     quarterlyDates.push(this.addMonthsWithDay(startDate, i * (12 / frequency), installmentDay));
                 }
 
-                const baseInstallment = this.findBaseInstallmentDecreasing(remainingPV, quarterlyDates, decreaseRate / 100, frequency);
+                if (remainingPV <= 0) {
+                    throw new Error('⚠️ الدفعات المعروفة تتجاوز قيمة الكاش.');
+                }
 
-                // حماية: التحقق من أن القسط الأساسي موجب
-                if (remainingPV <= 0 || baseInstallment <= 0) {
-                    throw new Error(`⚠️ الدفعات المعروفة تتجاوز قيمة الكاش. يرجى تقليل المقدم أو الدفعات الإضافية.`);
+                const hasProposed = proposedInstallments.length > 0 && proposedYears > 0 && proposedYears < numberOfYears;
+                const proposedCount = hasProposed ? proposedYears * frequency : 0;
+                let autoBaseDecr;
+
+                if (hasProposed) {
+                    let proposedPV = 0;
+                    for (let i = 0; i < Math.min(proposedCount, quarterlyDates.length); i++) {
+                        const yearIdx = Math.floor(i / frequency);
+                        const yearAmount = proposedInstallments[yearIdx]?.amount || 0;
+                        proposedPV += this.calculatePVWithDate(yearAmount, quarterlyDates[i]);
+                    }
+                    const autoRemPV = remainingPV - proposedPV;
+                    if (autoRemPV <= 0) {
+                        throw new Error('⚠️ الأقساط المقترحة مرتفعة جداً. إجمالي PV يتجاوز المتبقي. يرجى تقليل القيم.');
+                    }
+                    const autoDates = quarterlyDates.slice(proposedCount);
+                    if (autoDates.length === 0) throw new Error('⚠️ عدد سنوات المقترح يجب أن يكون أقل من الإجمالي.');
+                    autoBaseDecr = this.findBaseInstallmentDecreasing(autoRemPV, autoDates, decreaseRate / 100, frequency);
+                    if (autoBaseDecr <= 0) throw new Error('⚠️ لا يمكن حساب أقساط متناقصة بهذه المعطيات.');
+                } else {
+                    autoBaseDecr = this.findBaseInstallmentDecreasing(remainingPV, quarterlyDates, decreaseRate / 100, frequency);
+                    if (autoBaseDecr <= 0) throw new Error('⚠️ لا يمكن حساب الأقساط.');
                 }
 
                 const freqLabel = frequency === 4 ? 'ربع سنوي' : frequency === 2 ? 'نصف سنوي' : 'سنوي';
                 quarterlyDates.forEach((date, index) => {
-                    const yearIndex = Math.floor(index / frequency);
+                    let amount;
+                    const yearIdx = Math.floor(index / frequency);
                     const periodInYear = (index % frequency) + 1;
-                    const amount = baseInstallment * Math.pow(1 - decreaseRate / 100, yearIndex);
+                    const isProposed = index < proposedCount;
+
+                    if (isProposed) {
+                        amount = proposedInstallments[yearIdx]?.amount || 0;
+                    } else {
+                        const autoIndex = index - proposedCount;
+                        const autoYearIdx = Math.floor(autoIndex / frequency);
+                        amount = autoBaseDecr * Math.pow(1 - decreaseRate / 100, autoYearIdx);
+                    }
+
                     const pv = this.calculatePVWithDate(amount, date);
                     schedule.push({
                         id: paymentId++,
-                        type: `قسط متناقص - سنة ${yearIndex + 1} / ${freqLabel} ${periodInYear}`,
+                        type: isProposed
+                            ? `قسط مقترح - سنة ${yearIdx + 1} / ${freqLabel} ${periodInYear}`
+                            : `قسط متناقص - سنة ${yearIdx + 1} / ${freqLabel} ${periodInYear}`,
                         date: this.formatDateLocal(date),
                         amount,
                         pv,
@@ -1013,7 +1084,7 @@
                     pattern: 'decreasing',
                     patternName: 'نظام الأقساط المتناقصة',
                     downPayment,
-                    baseInstallment,
+                    baseInstallment: autoBaseDecr,
                     decreaseRate,
                     numberOfInstallments: quarterlyDates.length,
                     annualPayments: annualPayments.length,
@@ -1064,7 +1135,9 @@
                     semiannualPayments = [],
                     quarterlyPayments = [],
                     quarterlyStartDate = null,
-                    installmentDay = 1
+                    installmentDay = 1,
+                    proposedInstallments = [],
+                    proposedYears = 0
                 } = params;
 
                 let knownPV = downPayment;
@@ -1149,22 +1222,53 @@
                     quarterlyDates.push(this.addMonthsWithDay(startDate, i * (12 / frequency), installmentDay));
                 }
 
-                const baseInstallment = this.findBaseInstallmentGraduated(remainingPV, quarterlyDates, growthRate / 100, frequency);
+                if (remainingPV <= 0) {
+                    throw new Error('⚠️ الدفعات المعروفة تتجاوز قيمة الكاش.');
+                }
 
-                // حماية: التحقق من أن القسط الأساسي موجب
-                if (remainingPV <= 0 || baseInstallment <= 0) {
-                    throw new Error(`⚠️ الدفعات المعروفة تتجاوز قيمة الكاش. يرجى تقليل المقدم أو الدفعات الإضافية.`);
+                const hasProposedG = proposedInstallments.length > 0 && proposedYears > 0 && proposedYears < numberOfYears;
+                const propCountG = hasProposedG ? proposedYears * frequency : 0;
+                let autoBaseGrad;
+
+                if (hasProposedG) {
+                    let propPV = 0;
+                    for (let i = 0; i < Math.min(propCountG, quarterlyDates.length); i++) {
+                        const yearIdx = Math.floor(i / frequency);
+                        const yearAmount = proposedInstallments[yearIdx]?.amount || 0;
+                        propPV += this.calculatePVWithDate(yearAmount, quarterlyDates[i]);
+                    }
+                    const autoRemPV = remainingPV - propPV;
+                    if (autoRemPV <= 0) throw new Error('⚠️ الأقساط المقترحة مرتفعة جداً.');
+                    const autoDates = quarterlyDates.slice(propCountG);
+                    if (autoDates.length === 0) throw new Error('⚠️ عدد سنوات المقترح يجب أن يكون أقل من الإجمالي.');
+                    autoBaseGrad = this.findBaseInstallmentGraduated(autoRemPV, autoDates, growthRate / 100, frequency);
+                    if (autoBaseGrad <= 0) throw new Error('⚠️ لا يمكن حساب أقساط متزايدة بهذه المعطيات.');
+                } else {
+                    autoBaseGrad = this.findBaseInstallmentGraduated(remainingPV, quarterlyDates, growthRate / 100, frequency);
+                    if (autoBaseGrad <= 0) throw new Error('⚠️ لا يمكن حساب الأقساط.');
                 }
 
                 const freqLabelG = frequency === 4 ? 'ربع سنوي' : frequency === 2 ? 'نصف سنوي' : 'سنوي';
                 quarterlyDates.forEach((date, index) => {
-                    const yearIndex = Math.floor(index / frequency);
+                    let amount;
+                    const yearIdx = Math.floor(index / frequency);
                     const periodInYear = (index % frequency) + 1;
-                    const amount = baseInstallment * Math.pow(1 + growthRate / 100, yearIndex);
+                    const isProposed = index < propCountG;
+
+                    if (isProposed) {
+                        amount = proposedInstallments[yearIdx]?.amount || 0;
+                    } else {
+                        const autoIdx = index - propCountG;
+                        const autoYearIdx = Math.floor(autoIdx / frequency);
+                        amount = autoBaseGrad * Math.pow(1 + growthRate / 100, autoYearIdx);
+                    }
+
                     const pv = this.calculatePVWithDate(amount, date);
                     schedule.push({
                         id: paymentId++,
-                        type: `قسط متزايد - سنة ${yearIndex + 1} / ${freqLabelG} ${periodInYear}`,
+                        type: isProposed
+                            ? `قسط مقترح - سنة ${yearIdx + 1} / ${freqLabelG} ${periodInYear}`
+                            : `قسط متزايد - سنة ${yearIdx + 1} / ${freqLabelG} ${periodInYear}`,
                         date: this.formatDateLocal(date),
                         amount,
                         pv,
@@ -1178,7 +1282,7 @@
                     pattern: 'graduated',
                     patternName: 'نظام الأقساط المتزايدة',
                     downPayment,
-                    baseInstallment,
+                    baseInstallment: autoBaseGrad,
                     growthRate,
                     numberOfInstallments: quarterlyDates.length,
                     annualPayments: annualPayments.length,
@@ -1657,7 +1761,13 @@
                             quarterlyYears: 8
                         },
                         description: 'مجمع سكني فاخر', 
-                        color: 'purple' 
+                        color: 'purple',
+                        deliveryDate: '2028-12-01',
+                        deliveryPaymentPercent: 50,
+                        deliveryPaymentBasis: 'unitValue',
+                        immediateDelivery: false,
+                        maintenancePercent: 8,
+                        maintenanceDueMonths: 6
                     },
                     { 
                         id: 2, 
@@ -1677,7 +1787,13 @@
                             quarterlyYears: 5
                         },
                         description: '🎯 استلام فورى: 30% مقدم و70% على 5 سنوات | مشروع متميز في مستقبل سيتى', 
-                        color: 'green' 
+                        color: 'green',
+                        deliveryDate: '2027-01-01',
+                        deliveryPaymentPercent: 30,
+                        deliveryPaymentBasis: 'unitValue',
+                        immediateDelivery: true,
+                        maintenancePercent: 8,
+                        maintenanceDueMonths: 6
                     },
                     { 
                         id: 3, 
@@ -1697,7 +1813,13 @@
                             quarterlyYears: 2
                         },
                         description: '🎯 عرض خاص: 50% مقدم والباقي على سنتين | مشروع متميز في مستقبل سيتى', 
-                        color: 'blue' 
+                        color: 'blue',
+                        deliveryDate: '2027-01-01',
+                        deliveryPaymentPercent: 50,
+                        deliveryPaymentBasis: 'unitValue',
+                        immediateDelivery: true,
+                        maintenancePercent: 8,
+                        maintenanceDueMonths: 6
                     }
                 ];
 
@@ -1823,6 +1945,24 @@
             const [frequency, setFrequency] = useState(4); // 4 = quarterly, 2 = semiannual, 1 = annual, 12 = monthly
             const [decreaseRate, setDecreaseRate] = useState(2);
             const [growthRate, setGrowthRate] = useState(3);
+            const [useProposedInstallment, setUseProposedInstallment] = useState(false);
+            const [proposedYears, setProposedYears] = useState(2);
+            const [proposedInstallments, setProposedInstallments] = useState([
+                { year: 1, amount: 0 },
+                { year: 2, amount: 0 }
+            ]);
+            const updateProposedYears = (newYears) => {
+                const y = Math.max(1, Math.min(newYears, 9));
+                setProposedYears(y);
+                const arr = [];
+                for (let i = 0; i < y; i++) {
+                    arr.push({ year: i + 1, amount: proposedInstallments[i]?.amount || 0 });
+                }
+                setProposedInstallments(arr);
+            };
+            const updateProposedAmount = (yearIdx, amount) => {
+                setProposedInstallments(prev => prev.map((p, i) => i === yearIdx ? { ...p, amount } : p));
+            };
             const [quarterlyStartDate, setQuarterlyStartDate] = useState('');
             const [installmentDay, setInstallmentDay] = useState(1); // 1 or 15
             const [roundingOption, setRoundingOption] = useState('100'); // 'none', '100', '500', '1000'
@@ -1972,11 +2112,16 @@
             <td style="padding:8px 12px; background:#F3F4F6; border:1px solid #D1D5DB; font-weight:bold; text-align:right">نظام السداد</td>
             <td style="padding:8px 12px; border:1px solid #D1D5DB; text-align:right">${results.patternName}</td>
         </tr>
-        <tr>
-            <td style="padding:8px 12px; background:#F3F4F6; border:1px solid #D1D5DB; font-weight:bold; text-align:right">خصم الكاش</td>
-            <td style="padding:8px 12px; border:1px solid #D1D5DB; text-align:right">${project?.cashDiscountRate || 0}%</td>
-            <td style="padding:8px 12px; background:#F3F4F6; border:1px solid #D1D5DB; font-weight:bold; text-align:right">قيمة الكاش (PV)</td>
-            <td style="padding:8px 12px; border:1px solid #D1D5DB; font-weight:bold; color:#1D4ED8; text-align:right">${formatCurrency(cashValue)}</td>
+
+    </table>
+
+    <!-- MAINTENANCE INFO -->
+    <table style="width:100%; border-collapse:collapse; margin-bottom:12px; font-size:12px">
+        <tr style="background:#F5F3FF">
+            <td style="padding:8px 12px; border:1px solid #D1D5DB; font-weight:bold; width:20%; text-align:right; color:#6B21A8">🔧 وديعة الصيانة (${project?.maintenancePercent || 8}%)</td>
+            <td style="padding:8px 12px; border:1px solid #D1D5DB; font-weight:bold; width:30%; text-align:right; color:#6B21A8; font-size:14px">${formatCurrency(Math.max(unitValue, results.summary.totalPaid) * (project?.maintenancePercent || 8) / 100)}</td>
+            <td style="padding:8px 12px; border:1px solid #D1D5DB; font-weight:bold; width:20%; text-align:right; color:#6B21A8">تاريخ استحقاق الصيانة</td>
+            <td style="padding:8px 12px; border:1px solid #D1D5DB; font-weight:bold; width:30%; text-align:right; color:#6B21A8">${(() => { const dm = project?.maintenanceDueMonths || 6; const ed = project?.immediateDelivery ? new Date() : (project?.deliveryDate ? new Date(project.deliveryDate) : null); if (!ed) return '-'; const md = new Date(ed); md.setMonth(md.getMonth() - dm); return md.toLocaleDateString('ar-EG', { year: 'numeric', month: 'long', day: 'numeric' }); })()}</td>
         </tr>
     </table>
 
@@ -2076,6 +2221,7 @@
             <td style="text-align:center; padding:10px; font-size:10px; color:#9CA3AF">
                 <div>شركة بيتا للتطوير العقاري - BETA Real Estate Development</div>
                 <div style="margin-top:3px">هاتف: 19231 | info@betadevelopments.com | جميع الحقوق محفوظة &copy; ${new Date().getFullYear()}</div>
+                <div style="margin-top:5px; font-weight:bold; color:#6B7280">Designed & Developed by DR. AMR ALTAMAWI | BETA SMART FINANCE v3.0</div>
             </td>
         </tr>
     </table>
@@ -2243,7 +2389,13 @@
                         downPaymentDate: null
                     },
                     description: 'وصف المشروع',
-                    color: 'indigo'
+                    color: 'indigo',
+                    deliveryDate: '',
+                    deliveryPaymentPercent: 50,
+                    deliveryPaymentBasis: 'unitValue',
+                    immediateDelivery: false,
+                    maintenancePercent: 8,
+                    maintenanceDueMonths: 6
                 };
                 setProjects([...projects, newProject]);
                 setEditingProject(newProject.id);
@@ -2340,6 +2492,23 @@
                     return;
                 }
 
+                // التحقق من صحة الأقساط المقترحة
+                if (useProposedInstallment && (selectedPattern === 'decreasing' || selectedPattern === 'graduated')) {
+                    const hasEmpty = proposedInstallments.some(p => !p.amount || p.amount <= 0);
+                    if (hasEmpty) {
+                        alert('⚠️ يرجى إدخال قيمة القسط لكل سنة مقترحة. جميع القيم يجب أن تكون أكبر من صفر.');
+                        return;
+                    }
+                    if (proposedYears >= numberOfYears) {
+                        alert(`⚠️ عدد سنوات المقترح (${proposedYears}) يجب أن يكون أقل من إجمالي السنوات (${numberOfYears}).`);
+                        return;
+                    }
+                    if (proposedYears < 1) {
+                        alert('⚠️ عدد سنوات المقترح يجب أن يكون سنة واحدة على الأقل.');
+                        return;
+                    }
+                }
+
                 const engine = new SmartPaymentEngine(
                     unitValue, 
                     project.cashDiscountRate, 
@@ -2418,10 +2587,14 @@
                             result = engine.calculateEqualInstallments({ ...commonParams, distributeUnitValue: isBaseSystemMatch });
                             break;
                         case 'decreasing':
-                            result = engine.calculateDecreasingPayments({ ...commonParams, decreaseRate });
+                            result = engine.calculateDecreasingPayments({ ...commonParams, decreaseRate,
+                                proposedInstallments: useProposedInstallment ? proposedInstallments : [],
+                                proposedYears: useProposedInstallment ? proposedYears : 0 });
                             break;
                         case 'graduated':
-                            result = engine.calculateGraduatedPayments({ ...commonParams, growthRate });
+                            result = engine.calculateGraduatedPayments({ ...commonParams, growthRate,
+                                proposedInstallments: useProposedInstallment ? proposedInstallments : [],
+                                proposedYears: useProposedInstallment ? proposedYears : 0 });
                             break;
                         case 'custom':
                             const customPaymentsProcessed = customPayments.map(p => ({
@@ -2506,6 +2679,49 @@
                     result.verification = engineForVerification.verifyScheduleXNPV(finalSchedule);
 
                     setResults(result);
+
+                    // ═══ التحقق من شرط الاستلام ═══
+                    const effectiveDeliveryDate = project.immediateDelivery ? new Date().toISOString().split('T')[0] : project.deliveryDate;
+                    if (effectiveDeliveryDate) {
+                        const deliveryDate = new Date(effectiveDeliveryDate);
+                        const requiredPercent = project.deliveryPaymentPercent || 50;
+                        const basis = project.deliveryPaymentBasis || 'unitValue';
+                        const totalPaidAll = result.summary?.totalPaid || result.schedule.reduce((s, p) => s + p.amount, 0);
+                        const basisAmount = basis === 'totalPaid' ? totalPaidAll : unitValue;
+                        const basisLabel = basis === 'totalPaid' ? 'الإجمالي المدفوع' : 'سعر الوحدة';
+                        const requiredAmount = basisAmount * requiredPercent / 100;
+                        
+                        let paidBeforeDelivery = 0;
+                        result.schedule.forEach(p => {
+                            if (new Date(p.date) <= deliveryDate) {
+                                paidBeforeDelivery += p.amount;
+                            }
+                        });
+                        
+                        const paidPercent = (paidBeforeDelivery / basisAmount) * 100;
+                        
+                        if (paidPercent < requiredPercent - 0.01) {
+                            const shortfall = requiredAmount - paidBeforeDelivery;
+                            setTimeout(() => {
+                                alert(
+                                    `⛔ تنبيه هام للبائع — شرط الاستلام غير مستوفى\n` +
+                                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+                                    `المشروع: ${project.name}\n` +
+                                    `تاريخ الاستلام: ${formatDate(project.deliveryDate)}\n\n` +
+                                    `النسبة المطلوبة: ${requiredPercent}% من ${basisLabel} = ${formatCurrency(requiredAmount)}\n` +
+                                    `المسدد فعلياً: ${paidPercent.toFixed(1)}% = ${formatCurrency(paidBeforeDelivery)}\n` +
+                                    `المبلغ الناقص: ${formatCurrency(shortfall)}\n\n` +
+                                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                                    `⚠️ لا يمكن اعتماد هذه الخطة بدون تعديل.\n` +
+                                    `الحلول المقترحة:\n` +
+                                    `• زيادة المقدم\n` +
+                                    `• إضافة دفعات مخصصة قبل ${formatDate(project.deliveryDate)}\n` +
+                                    `• تقصير مدة الأقساط لزيادة قيمة القسط\n` +
+                                    `• تغيير التردد (ربع سنوي بدل سنوي)\n`
+                                );
+                            }, 300);
+                        }
+                    }
 
                     // حفظ الحساب في قاعدة البيانات SQLite
                     saveCalculationToDB(result, project.id);
@@ -2649,6 +2865,82 @@
                                                         />
                                                     </div>
                                                 </div>
+                                                <div className="grid grid-cols-2 gap-3">
+                                                    <div>
+                                                        <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={project.immediateDelivery || false}
+                                                                onChange={(e) => updateProject(project.id, 'immediateDelivery', e.target.checked)}
+                                                                className="w-4 h-4"
+                                                            />
+                                                            🏠 استلام فوري
+                                                        </label>
+                                                        {!project.immediateDelivery && (
+                                                            <>
+                                                                <label className="text-xs text-gray-500">تاريخ الاستلام المتوقع</label>
+                                                                <input
+                                                                    type="date"
+                                                                    value={project.deliveryDate || ''}
+                                                                    onChange={(e) => updateProject(project.id, 'deliveryDate', e.target.value)}
+                                                                    className="w-full px-3 py-2 border rounded-lg modern-input"
+                                                                />
+                                                            </>
+                                                        )}
+                                                        {project.immediateDelivery && (
+                                                            <p className="text-xs text-green-600 font-bold mt-1">✅ تاريخ الاستلام = تاريخ التعاقد</p>
+                                                        )}
+                                                    </div>
+                                                    <div>
+                                                        <label className="text-sm font-medium text-gray-700">نسبة السداد عند الاستلام (%)</label>
+                                                        <input
+                                                            type="number"
+                                                            step="1"
+                                                            min="0"
+                                                            max="100"
+                                                            value={project.deliveryPaymentPercent || 50}
+                                                            onChange={(e) => updateProject(project.id, 'deliveryPaymentPercent', parseFloat(e.target.value) || 50)}
+                                                            className="w-full px-3 py-2 border rounded-lg modern-input"
+                                                        />
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="text-sm font-medium text-gray-700">أساس حساب نسبة الاستلام</label>
+                                                    <select
+                                                        value={project.deliveryPaymentBasis || 'unitValue'}
+                                                        onChange={(e) => updateProject(project.id, 'deliveryPaymentBasis', e.target.value)}
+                                                        className="w-full px-3 py-2 border rounded-lg modern-input"
+                                                    >
+                                                        <option value="unitValue">من سعر الوحدة</option>
+                                                        <option value="totalPaid">من الإجمالي المدفوع</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label className="text-sm font-medium text-gray-700">🔧 نسبة الصيانة (%)</label>
+                                                    <input
+                                                        type="number"
+                                                        step="0.5"
+                                                        min="0"
+                                                        max="30"
+                                                        value={project.maintenancePercent || 8}
+                                                        onChange={(e) => updateProject(project.id, 'maintenancePercent', parseFloat(e.target.value) || 8)}
+                                                        className="w-full px-3 py-2 border rounded-lg modern-input"
+                                                    />
+                                                    <p className="text-xs text-gray-400 mt-1">تُحسب من الأكبر: سعر الوحدة أو الإجمالي المدفوع</p>
+                                                </div>
+                                                <div>
+                                                    <label className="text-sm font-medium text-gray-700">استحقاق الصيانة قبل الاستلام بـ (شهر)</label>
+                                                    <input
+                                                        type="number"
+                                                        step="1"
+                                                        min="0"
+                                                        max="24"
+                                                        value={project.maintenanceDueMonths || 6}
+                                                        onChange={(e) => updateProject(project.id, 'maintenanceDueMonths', parseInt(e.target.value) || 6)}
+                                                        className="w-full px-3 py-2 border rounded-lg modern-input"
+                                                    />
+                                                    <p className="text-xs text-gray-400 mt-1">تاريخ استحقاق الصيانة = تاريخ الاستلام - عدد الأشهر</p>
+                                                </div>
                                                 <div className="flex justify-end gap-3 mt-4">
                                                     <button 
                                                         onClick={() => {
@@ -2677,6 +2969,8 @@
                                                         <span>خصم كاش: <span className="font-bold text-red-600">{project.cashDiscountRate}%</span></span>
                                                         <span>معدل خصم: <span className="font-bold text-blue-600">{project.discountRate.toFixed(3)}%</span></span>
                                                         <span>حد أدنى للمقدم: <span className="font-bold text-green-600">{project.minDownPaymentPercent}%</span></span>
+                                                        {(project.deliveryDate || project.immediateDelivery) && <span>استلام: <span className="font-bold text-purple-600">{project.immediateDelivery ? 'فوري' : formatDate(project.deliveryDate)} ({project.deliveryPaymentPercent || 50}%)</span></span>}
+                                                        <span>صيانة: <span className="font-bold text-orange-600">{project.maintenancePercent || 8}% (قبل {project.maintenanceDueMonths || 6} شهر)</span></span>
                                                     </div>
                                                 </div>
                                                 <button onClick={() => setEditingProject(project.id)} className="bg-gray-200 hover:bg-gray-300 px-4 py-2 rounded-lg text-sm">
@@ -3098,7 +3392,7 @@
                                 <div className="flex items-center justify-between mb-4">
                                     <div>
                                         <h1 className="text-4xl font-bold mb-2">🏢 نظام التقسيط المرن</h1>
-                                        <p className="text-gray-300 text-lg">BETA SMART FINANCE | شركة بيتا للتطوير العقاري <span className="text-red-500 font-bold">SINCE 1993</span></p>
+                                        <p className="text-gray-300 text-lg">BETA SMART FINANCE v3.0 | شركة بيتا للتطوير العقاري <span className="text-red-500 font-bold">SINCE 1993</span></p>
                                     </div>
                                     <button onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminPanel(true)} className="bg-red-600/80 hover:bg-red-600 px-6 py-3 rounded-xl backdrop-blur-lg transition">
                                         {isAdmin ? '🔒 خروج المدير' : '⚙️ دخول المدير'}
@@ -3317,6 +3611,63 @@
                                                             className="w-full modern-input px-4 py-2"
                                                             placeholder="النسبة %"
                                                         />
+                                                    </div>
+                                                )}
+
+                                                {/* Proposed Installment for first years */}
+                                                {(selectedPattern === 'decreasing' || selectedPattern === 'graduated') && (
+                                                    <div className="p-3 bg-yellow-50 rounded-lg border border-yellow-300">
+                                                        <label className="flex items-center gap-2 cursor-pointer mb-2">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={useProposedInstallment}
+                                                                onChange={(e) => setUseProposedInstallment(e.target.checked)}
+                                                                className="w-4 h-4 text-yellow-600"
+                                                            />
+                                                            <span className="text-sm font-bold text-gray-700">💡 اقتراح أقساط مخصصة لأول سنوات</span>
+                                                        </label>
+                                                        {useProposedInstallment && (
+                                                            <div className="space-y-3 mt-2">
+                                                                <div>
+                                                                    <label className="text-xs text-gray-600 font-bold">عدد السنوات المقترحة</label>
+                                                                    <input
+                                                                        type="number"
+                                                                        min="1"
+                                                                        max={numberOfYears - 1}
+                                                                        value={proposedYears}
+                                                                        onChange={(e) => updateProposedYears(parseInt(e.target.value) || 2)}
+                                                                        className="w-32 modern-input px-3 py-2 text-sm"
+                                                                    />
+                                                                    <span className="text-xs text-gray-400 mr-2">الباقي ({numberOfYears - proposedYears} سنوات) يحسب تلقائياً</span>
+                                                                </div>
+                                                                <div className="bg-white rounded-lg p-2 border border-yellow-200">
+                                                                    <table className="w-full text-sm">
+                                                                        <thead>
+                                                                            <tr className="text-gray-500 text-xs">
+                                                                                <th className="text-right py-1 px-2">السنة</th>
+                                                                                <th className="text-right py-1 px-2">القسط المقترح (ج)</th>
+                                                                            </tr>
+                                                                        </thead>
+                                                                        <tbody>
+                                                                            {proposedInstallments.map((p, idx) => (
+                                                                                <tr key={idx} className="border-t border-yellow-100">
+                                                                                    <td className="py-1 px-2 font-bold text-gray-700">سنة {p.year}</td>
+                                                                                    <td className="py-1 px-2">
+                                                                                        <input
+                                                                                            type="number"
+                                                                                            value={p.amount || ''}
+                                                                                            onChange={(e) => updateProposedAmount(idx, parseFloat(e.target.value) || 0)}
+                                                                                            className="w-full modern-input px-2 py-1 text-sm"
+                                                                                            placeholder="مثلاً: 80000"
+                                                                                        />
+                                                                                    </td>
+                                                                                </tr>
+                                                                            ))}
+                                                                        </tbody>
+                                                                    </table>
+                                                                </div>
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 )}
                                             </div>
@@ -3612,11 +3963,29 @@
                                                 <div><span className="font-bold">المشروع:</span> {getSelectedProject()?.name}</div>
                                                 <div><span className="font-bold">نظام السداد:</span> {results.patternName}</div>
                                                 <div><span className="font-bold">قيمة الوحدة:</span> {formatCurrency(unitValue)}</div>
-                                                <div><span className="font-bold">قيمة الكاش (PV):</span> {formatCurrency(getSelectedProject()?.cashDiscountRate ? unitValue * (1 - getSelectedProject().cashDiscountRate / 100) : unitValue)}</div>
+                                                {(() => {
+                                                    const proj = getSelectedProject();
+                                                    const mPct = proj?.maintenancePercent || 8;
+                                                    const tPaid = results.summary?.totalPaid || 0;
+                                                    const mBasis = Math.max(unitValue, tPaid);
+                                                    const mFee = mBasis * mPct / 100;
+                                                    const dueM = proj?.maintenanceDueMonths || 6;
+                                                    const effD = proj?.immediateDelivery ? new Date() : (proj?.deliveryDate ? new Date(proj.deliveryDate) : null);
+                                                    let mDueDate = null;
+                                                    if (effD) { mDueDate = new Date(effD); mDueDate.setMonth(mDueDate.getMonth() - dueM); }
+                                                    return (
+                                                        <>
+                                                            <div><span className="font-bold">🔧 وديعة الصيانة ({mPct}%):</span> <span className="text-purple-700 font-bold">{formatCurrency(mFee)}</span></div>
+                                                            {mDueDate && <div><span className="font-bold">تاريخ استحقاق الصيانة:</span> {formatDate(mDueDate.toISOString().split('T')[0])}</div>}
+                                                        </>
+                                                    );
+                                                })()}
                                             </div>
                                             <div className="grid grid-cols-2 gap-4 text-lg pt-2">
                                                 <div><span className="font-bold">رقم الوحدة/العميل:</span> {unitNumber || 'غير محدد'}</div>
                                                 <div><span className="font-bold">مدة التقسيط:</span> {results.pattern !== 'custom' ? `${numberOfYears} سنوات (${results.schedule.filter(p => p.type.includes('قسط')).length} قسط)` : 'مخصص'}</div>
+                                                {(getSelectedProject()?.deliveryDate || getSelectedProject()?.immediateDelivery) && <div><span className="font-bold">تاريخ الاستلام:</span> {getSelectedProject()?.immediateDelivery ? 'استلام فوري' : formatDate(getSelectedProject().deliveryDate)}</div>}
+                                                {(getSelectedProject()?.deliveryDate || getSelectedProject()?.immediateDelivery) && <div><span className="font-bold">نسبة السداد المطلوبة عند الاستلام:</span> {getSelectedProject().deliveryPaymentPercent || 50}%</div>}
                                             </div>
                                         </div>
 
@@ -3629,7 +3998,7 @@
                                             <div className="bg-white rounded-lg p-4 text-center shadow">
                                                 <p className="text-sm text-gray-600 mb-1">القسط الأول</p>
                                                 <p className="text-xl font-bold text-red-600">
-                                                    {formatCurrency(results.installmentAmount || results.baseInstallment || results.schedule.find(p => p.type.includes('قسط'))?.amount || 0)}
+                                                    {formatCurrency(results.schedule.find(p => p.type.includes('قسط'))?.amount || results.installmentAmount || results.baseInstallment || 0)}
                                                 </p>
                                             </div>
                                             <div className="bg-white rounded-lg p-4 text-center shadow">
@@ -3641,6 +4010,129 @@
                                                 <p className="text-xl font-bold text-green-600">{formatCurrency(results.summary.totalPaid)}</p>
                                             </div>
                                         </div>
+
+                                        {/* Maintenance Fee - قيمة الصيانة */}
+                                        {(() => {
+                                            const project = getSelectedProject();
+                                            const mPercent = project?.maintenancePercent || 8;
+                                            const totalPaidVal = results.summary?.totalPaid || 0;
+                                            const basisVal = Math.max(unitValue, totalPaidVal);
+                                            const basisName = basisVal === unitValue ? 'سعر الوحدة' : 'الإجمالي المدفوع';
+                                            const maintenanceFee = basisVal * mPercent / 100;
+                                            
+                                            return (
+                                                <div className="mt-4 p-4 bg-purple-50 rounded-xl border-2 border-purple-200">
+                                                    <h3 className="text-lg font-bold text-purple-800 mb-3">🔧 وديعة الصيانة</h3>
+                                                    {(() => {
+                                                        const dueMonths = project?.maintenanceDueMonths || 6;
+                                                        const effDeliv = project?.immediateDelivery ? new Date() : (project?.deliveryDate ? new Date(project.deliveryDate) : null);
+                                                        let maintenanceDueDate = null;
+                                                        if (effDeliv) {
+                                                            maintenanceDueDate = new Date(effDeliv);
+                                                            maintenanceDueDate.setMonth(maintenanceDueDate.getMonth() - dueMonths);
+                                                        }
+                                                        return maintenanceDueDate ? (
+                                                            <div className="mb-3 p-2 bg-purple-100 rounded-lg text-center">
+                                                                <span className="text-sm text-purple-700 font-bold">📅 تاريخ استحقاق الصيانة: {formatDate(maintenanceDueDate.toISOString().split('T')[0])} </span>
+                                                                <span className="text-xs text-purple-500">(قبل الاستلام بـ {dueMonths} أشهر)</span>
+                                                            </div>
+                                                        ) : null;
+                                                    })()}
+                                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                                        <div className="bg-white rounded-lg p-3 text-center shadow-sm">
+                                                            <p className="text-xs text-gray-500">نسبة الصيانة</p>
+                                                            <p className="text-lg font-bold text-purple-700">{mPercent}%</p>
+                                                        </div>
+                                                        <div className="bg-white rounded-lg p-3 text-center shadow-sm">
+                                                            <p className="text-xs text-gray-500">أساس الحساب ({basisName})</p>
+                                                            <p className="text-lg font-bold text-gray-700">{formatCurrency(basisVal)}</p>
+                                                        </div>
+                                                        <div className="bg-white rounded-lg p-3 text-center shadow-sm">
+                                                            <p className="text-xs text-gray-500">قيمة وديعة الصيانة</p>
+                                                            <p className="text-xl font-bold text-purple-700">{formatCurrency(maintenanceFee)}</p>
+                                                        </div>
+                                                        <div className="bg-white rounded-lg p-3 text-center shadow-sm">
+                                                            <p className="text-xs text-gray-500">الإجمالي شامل الصيانة</p>
+                                                            <p className="text-lg font-bold text-green-700">{formatCurrency(totalPaidVal + maintenanceFee)}</p>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
+
+                                        {/* Delivery Analysis - تحليل الاستلام */}
+                                        {(() => {
+                                            const project = getSelectedProject();
+                                            const effDelivDate = project?.immediateDelivery ? new Date().toISOString().split('T')[0] : project?.deliveryDate;
+                                            if (!effDelivDate || !unitValue) return null;
+                                            const deliveryDate = new Date(effDelivDate);
+                                            const requiredPercent = project.deliveryPaymentPercent || 50;
+                                            const basisType = project.deliveryPaymentBasis || 'unitValue';
+                                            const totalPaidAll = results.summary?.totalPaid || results.schedule.reduce((s, p) => s + p.amount, 0);
+                                            const basisAmount = basisType === 'totalPaid' ? totalPaidAll : unitValue;
+                                            const basisLabel = basisType === 'totalPaid' ? 'الإجمالي المدفوع' : 'سعر الوحدة';
+                                            const requiredAmount = basisAmount * requiredPercent / 100;
+                                            
+                                            let paidBeforeDelivery = 0;
+                                            let lastPaymentBeforeDelivery = null;
+                                            let firstPaymentAfterDelivery = null;
+                                            
+                                            results.schedule.forEach(p => {
+                                                const pDate = new Date(p.date);
+                                                if (pDate <= deliveryDate) {
+                                                    paidBeforeDelivery += p.amount;
+                                                    lastPaymentBeforeDelivery = p;
+                                                } else if (!firstPaymentAfterDelivery) {
+                                                    firstPaymentAfterDelivery = p;
+                                                }
+                                            });
+                                            
+                                            const paidPercent = (paidBeforeDelivery / basisAmount) * 100;
+                                            const isMet = paidPercent >= requiredPercent - 0.01;
+                                            const shortfall = requiredAmount - paidBeforeDelivery;
+                                            
+                                            return (
+                                                <div className={`mt-4 p-4 rounded-xl border-2 ${isMet ? 'bg-green-50 border-green-300' : 'bg-red-50 border-red-300'}`}>
+                                                    <h3 className={`text-lg font-bold mb-3 ${isMet ? 'text-green-800' : 'text-red-800'}`}>
+                                                        {isMet ? '✅' : '⚠️'} تحليل السداد عند الاستلام — {project.immediateDelivery ? '🏠 استلام فوري' : formatDate(effDelivDate)}
+                                                    </h3>
+                                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                                        <div className="bg-white rounded-lg p-3 text-center shadow-sm">
+                                                            <p className="text-xs text-gray-500">المطلوب ({requiredPercent}% من {basisLabel})</p>
+                                                            <p className="text-lg font-bold text-gray-800">{formatCurrency(requiredAmount)}</p>
+                                                        </div>
+                                                        <div className="bg-white rounded-lg p-3 text-center shadow-sm">
+                                                            <p className="text-xs text-gray-500">المسدد حتى الاستلام</p>
+                                                            <p className={`text-lg font-bold ${isMet ? 'text-green-600' : 'text-red-600'}`}>{formatCurrency(paidBeforeDelivery)}</p>
+                                                        </div>
+                                                        <div className="bg-white rounded-lg p-3 text-center shadow-sm">
+                                                            <p className="text-xs text-gray-500">نسبة السداد الفعلية</p>
+                                                            <p className={`text-lg font-bold ${isMet ? 'text-green-600' : 'text-red-600'}`}>{paidPercent.toFixed(1)}%</p>
+                                                        </div>
+                                                        <div className="bg-white rounded-lg p-3 text-center shadow-sm">
+                                                            <p className="text-xs text-gray-500">{isMet ? 'فائض عن المطلوب' : 'المبلغ الناقص'}</p>
+                                                            <p className={`text-lg font-bold ${isMet ? 'text-green-600' : 'text-red-600'}`}>{formatCurrency(Math.abs(shortfall))}</p>
+                                                        </div>
+                                                    </div>
+                                                    {!isMet && (
+                                                        <div className="mt-3 p-3 bg-red-100 rounded-lg border border-red-200">
+                                                            <p className="text-red-800 font-bold text-sm">
+                                                                ⛔ رسالة للبائع: خطة السداد المقترحة لا تستوفي شرط سداد {requiredPercent}% من {basisLabel} قبل تاريخ الاستلام ({formatDate(project.deliveryDate)}). 
+                                                                ينقص مبلغ {formatCurrency(shortfall)} للوصول إلى النسبة المطلوبة. 
+                                                                يرجى تعديل خطة السداد بزيادة المقدم أو إضافة دفعات قبل تاريخ الاستلام أو تقصير مدة الأقساط.
+                                                            </p>
+                                                        </div>
+                                                    )}
+                                                    {isMet && (
+                                                        <div className="mt-3 p-3 bg-green-100 rounded-lg border border-green-200">
+                                                            <p className="text-green-800 font-bold text-sm">
+                                                                ✅ خطة السداد تستوفي شرط سداد {requiredPercent}% من {basisLabel} قبل الاستلام. النسبة المسددة الفعلية: {paidPercent.toFixed(1)}%
+                                                            </p>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
                                         
                                         {/* Schedule Table */}
                                         <div className="mt-6 overflow-x-auto">
@@ -3657,16 +4149,55 @@
                                                     </tr>
                                                 </thead>
                                                 <tbody className="text-gray-700 text-sm font-light">
-                                                    {results.schedule.map((p, index) => (
-                                                        <tr key={index} className={`border-b border-gray-200 hover:bg-gray-50 ${p.type === 'مقدم' ? 'bg-blue-50 font-bold' : ''}`}>
-                                                            <td className="py-3 px-6 text-right whitespace-nowrap">{p.id}</td>
-                                                            <td className="py-3 px-6 text-right whitespace-nowrap">{formatDate(p.date)}</td>
-                                                            <td className="py-3 px-6 text-right whitespace-nowrap">{p.type}</td>
-                                                            <td className="py-3 px-6 text-right whitespace-nowrap font-bold text-lg">{formatCurrency(p.amount)}</td>
-                                                            {isAdmin && <td className="py-3 px-6 text-right whitespace-nowrap print-hidden">{formatCurrency(p.pv)}</td>}
-                                                            {isAdmin && <td className="py-3 px-6 text-right whitespace-nowrap print-hidden">{formatCurrency(p.discount)}</td>}
-                                                        </tr>
-                                                    ))}
+                                                    {(() => {
+                                                        const project = getSelectedProject();
+                                                        const schedDelivDate = project?.immediateDelivery ? new Date().toISOString().split('T')[0] : project?.deliveryDate;
+                                                        const deliveryDate = schedDelivDate ? new Date(schedDelivDate) : null;
+                                                        let cumulative = 0;
+                                                        let deliveryRowInserted = false;
+                                                        const rows = [];
+                                                        
+                                                        results.schedule.forEach((p, index) => {
+                                                            cumulative += p.amount;
+                                                            const pDate = new Date(p.date);
+                                                            
+                                                            // Insert delivery marker row before the first payment AFTER delivery date
+                                                            if (deliveryDate && !deliveryRowInserted && pDate > deliveryDate) {
+                                                                deliveryRowInserted = true;
+                                                                rows.push(
+                                                                    <tr key="delivery-marker" className="bg-amber-100 border-2 border-amber-400">
+                                                                        <td className="py-2 px-6 text-right font-bold text-amber-700" colSpan={isAdmin ? 6 : 4}>
+                                                                            🏠 تاريخ الاستلام: {formatDate(project.deliveryDate)} — المسدد: {formatCurrency(cumulative - p.amount)} ({((cumulative - p.amount) / unitValue * 100).toFixed(1)}%)
+                                                                        </td>
+                                                                    </tr>
+                                                                );
+                                                            }
+                                                            
+                                                            rows.push(
+                                                                <tr key={index} className={`border-b border-gray-200 hover:bg-gray-50 ${p.type === 'مقدم' ? 'bg-blue-50 font-bold' : ''}`}>
+                                                                    <td className="py-3 px-6 text-right whitespace-nowrap">{p.id}</td>
+                                                                    <td className="py-3 px-6 text-right whitespace-nowrap">{formatDate(p.date)}</td>
+                                                                    <td className="py-3 px-6 text-right whitespace-nowrap">{p.type}</td>
+                                                                    <td className="py-3 px-6 text-right whitespace-nowrap font-bold text-lg">{formatCurrency(p.amount)}</td>
+                                                                    {isAdmin && <td className="py-3 px-6 text-right whitespace-nowrap print-hidden">{formatCurrency(p.pv)}</td>}
+                                                                    {isAdmin && <td className="py-3 px-6 text-right whitespace-nowrap print-hidden">{formatCurrency(p.discount)}</td>}
+                                                                </tr>
+                                                            );
+                                                        });
+                                                        
+                                                        // If delivery date is after all payments
+                                                        if (deliveryDate && !deliveryRowInserted) {
+                                                            rows.push(
+                                                                <tr key="delivery-marker" className="bg-amber-100 border-2 border-amber-400">
+                                                                    <td className="py-2 px-6 text-right font-bold text-amber-700" colSpan={isAdmin ? 6 : 4}>
+                                                                        🏠 تاريخ الاستلام: {formatDate(project.deliveryDate)} — المسدد: {formatCurrency(cumulative)} ({((cumulative) / unitValue * 100).toFixed(1)}%)
+                                                                    </td>
+                                                                </tr>
+                                                            );
+                                                        }
+                                                        
+                                                        return rows;
+                                                    })()}
                                                     <tr className="bg-gray-200 font-bold text-base">
                                                         <td className="py-3 px-6 text-right" colSpan={isAdmin ? 3 : 2}>الإجمالي</td>
                                                         <td className="py-3 px-6 text-right text-green-700">{formatCurrency(results.summary.totalPaid)}</td>
@@ -3679,20 +4210,6 @@
 
                                         {/* Footer Print Info */}
                                         <div className="print-only mt-8">
-                                            <div className="grid grid-cols-3 gap-4 border-t pt-4 text-sm">
-                                                <div>
-                                                    <p className="text-gray-600">القيمة الحالية (PV)</p>
-                                                    <p className="font-bold text-blue-700">{formatCurrency(results.summary.totalPV)}</p>
-                                                </div>
-                                                <div>
-                                                    <p className="text-gray-600">إجمالي الخصم</p>
-                                                    <p className="font-bold text-red-700">{formatCurrency(results.summary.totalDiscount)}</p>
-                                                </div>
-                                                <div>
-                                                    <p className="text-gray-600">معدل الفائدة الفعلي</p>
-                                                    <p className="font-bold text-orange-700">{results.summary.effectiveInterestRate.toFixed(2)}%</p>
-                                                </div>
-                                            </div>
                                             
                                             <div className="mt-8 grid grid-cols-2 gap-8">
                                                 <div className="text-center">
@@ -3707,6 +4224,7 @@
                                             <div className="text-center mt-8 text-sm text-gray-600">
                                                 <p>شركة بيتا للتطوير العقاري - BETA SMART FINANCE</p>
                                                 <p className="mt-1">هاتف: 19231 - info@betadevelopments.com</p>
+                                                <p className="mt-2 text-xs font-bold text-gray-500">Designed & Developed by DR. AMR ALTAMAWI | BETA SMART FINANCE v3.0</p>
                                             </div>
                                         </div>
                                     </div>
@@ -3895,12 +4413,13 @@
                         {/* Footer */}
                         <div className="text-center text-gray-600 text-sm mt-8 pb-8 print-hidden">
                             <p className="font-bold text-red-600 text-lg">شركة بيتا للتطوير العقاري</p>
-                            <p className="mt-1">BETA SMART FINANCE | نظام التقسيط المرن - DR. AMR ALTAMAWI</p>
+                            <p className="mt-1">BETA SMART FINANCE | نظام التقسيط المرن - دقة عالية - خدمة متميزة</p>
                             <p className="mt-1 text-xs text-gray-400">
                                 {dbReady ? '🗄️ SQLite Database Active' : '💾 localStorage Mode'}
                                 {dbStats.calculationCount > 0 && ` | ${dbStats.calculationCount} عملية محفوظة`}
                             </p>
                             <p className="mt-2">© 2025 جميع الحقوق محفوظة</p>
+                            <p className="mt-2 text-sm font-bold text-gray-700">Designed & Developed by DR. AMR ALTAMAWI</p>
                         </div>
                     </div>
                 </div>
